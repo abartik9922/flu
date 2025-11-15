@@ -41,7 +41,7 @@ export async function onRequest(context) {
 
     // Sadece .jpg uzantılı dosyalara izin ver
     const pathname = url.pathname.toLowerCase();
-    if (!pathname.endsWith('.jpg') && !pathname.endsWith('.jpeg')) {
+    if (!pathname.endsWith('.jpg') && !pathname.endsWith('.jpg')) {
       return new Response('Forbidden', { 
         status: 403,
         headers: { 
