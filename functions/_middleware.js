@@ -6,236 +6,155 @@
 
 const ORIGIN_URL = 'https://wahdangeldim.global.ssl.fastly.net';
 
-// Cache süresi ayarları (saniye cinsinden)
-const CACHE_DURATION = {
-  browser: 300,          // 1 saat browser cache (HLS segment'leri için yeterli)
-  edge: 86400 * 365,      // 1 yıl edge cache (Cloudflare)
-  staleWhileRevalidate: 86400 * 7  // 7 gün stale-while-revalidate
+// CORS Header'ları standartlaştırıldı
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Range, User-Agent, X-Requested-With',
+  'Access-Control-Expose-Headers': 'Content-Length, Content-Range, ETag, Last-Modified',
+  'Access-Control-Max-Age': '86400',
 };
 
-// In-flight requests map - Cache stampede protection
-// Aynı URL için eşzamanlı istekleri tek bir fetch'e indirgeme
-const inflightRequests = new Map();
-
 export async function onRequest(context) {
-  const { request, env, waitUntil } = context;
-  
-  try {
-    const url = new URL(request.url);
-    
-    // Sadece GET ve HEAD isteklerini işle
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
-      return new Response('Method not allowed', { status: 405 });
-    }
+  const { request, waitUntil } = context;
+  const url = new URL(request.url);
 
-    // Health check endpoint
-    if (url.pathname === '/health' || url.pathname === '/') {
-      return new Response('x', { 
-        status: 200,
-        headers: { 
-          'Content-Type': 'text/plain',
-          'X-Powered-By': 'Cloudflare-Pages-CDN'
-        }
-      });
-    }
-
-    // Sadece .jpg uzantılı dosyalara izin ver
-    const pathname = url.pathname.toLowerCase();
-    if (!pathname.endsWith('.jpg') && !pathname.endsWith('.jpg')) {
-      return new Response('Forbidden', { 
-        status: 403,
-        headers: { 
-          'Content-Type': 'text/plain',
-          'Cache-Control': 'no-store'
-        }
-      });
-    }
-
-    // Referer kontrolü - Referer yoksa 403
-    const referer = request.headers.get('referer') || request.headers.get('referrer');
-    if (!referer) {
-      return new Response('Forbidden', { 
-        status: 403,
-        headers: { 
-          'Content-Type': 'text/plain',
-          'Cache-Control': 'no-store'
-        }
-      });
-    }
-
-    // Cache key oluştur (URL + Range header)
-    const rangeHeader = request.headers.get('range');
-    const cacheKey = new Request(url.toString(), {
-      method: 'GET',
-      headers: rangeHeader ? { 'range': rangeHeader } : {}
+  // 1. OPTIONS İsteğini Karşıla (CORS Preflight)
+  // Bu olmazsa tarayıcı GET isteğini hiç atmaz.
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 204,
+      headers: corsHeaders
     });
+  }
 
-    // Cloudflare Cache API'sini kullan
+  // 2. Sadece GET ve HEAD'e izin ver
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return new Response('Method Not Allowed', { 
+      status: 405, 
+      headers: corsHeaders 
+    });
+  }
+
+  // 3. Health Check
+  if (url.pathname === '/health' || url.pathname === '/') {
+    return new Response('OK', { 
+      status: 200, 
+      headers: corsHeaders 
+    });
+  }
+
+  try {
+    // Cache API
     const cache = caches.default;
     
-    // Cache'den kontrol et
+    // Range varsa cache key'den ayırıyoruz ki ana dosyayı cache'leyebilelim.
+    // Ancak Cloudflare free planda range cache yönetimi zordur, bu yüzden
+    // HLS segmentleri küçükse range'i cache key'e katmak daha güvenlidir.
+    // Şimdilik en basit ve çalışır haliyle URL'i baz alıyoruz.
+    const cacheKey = new Request(url.toString(), request);
+
+    // 4. Cache Kontrolü
     let response = await cache.match(cacheKey);
-    
+
     if (response) {
-      // Cache HIT - direkt dön
-      const headers = new Headers(response.headers);
-      headers.set('CF-Cache-Status', 'HIT');
-      
+      // Cache HIT olsa bile CORS headerlarını tazelemek gerekebilir
+      const newHeaders = new Headers(response.headers);
+      newHeaders.set('CF-Cache-Status', 'HIT');
+      // CORS headerlarını üzerine yaz
+      Object.keys(corsHeaders).forEach(key => newHeaders.set(key, corsHeaders[key]));
+
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
-        headers: headers
+        headers: newHeaders
       });
     }
 
-    // Cache MISS - Origin'den fetch et
-    const originUrl = `${ORIGIN_URL}${url.pathname}${url.search}`;
+    // 5. Origin Fetch (Headers Hazırlığı)
+    const originHeaders = new Headers();
     
-    // Request Coalescing: Aynı URL için zaten bir fetch varsa onu bekle
-    const cacheKeyString = cacheKey.url + (rangeHeader || '');
-    let inflightPromise = inflightRequests.get(cacheKeyString);
-    
-    if (!inflightPromise) {
-      // Yeni fetch başlat
-      inflightPromise = (async () => {
-        try {
-          // Origin request headers
-          const originHeaders = new Headers();
-          
-          // Range request varsa ilet (HLS için kritik)
-          if (rangeHeader) {
-            originHeaders.set('Range', rangeHeader);
-          }
-          
-          // Diğer önemli headers
-          const headersToProxy = [
-            'accept',
-            'accept-encoding',
-            'user-agent',
-            'if-none-match',
-            'if-modified-since'
-          ];
-          
-          headersToProxy.forEach(header => {
-            const value = request.headers.get(header);
-            if (value) originHeaders.set(header, value);
-          });
+    // Kritik headerları kopyala
+    const allowedForwardHeaders = ['range', 'user-agent', 'accept', 'accept-encoding'];
+    allowedForwardHeaders.forEach(h => {
+      const val = request.headers.get(h);
+      if (val) originHeaders.set(h, val);
+    });
 
-          // Origin'e istek gönder
-          const originResponse = await fetch(originUrl, {
-            method: request.method,
-            headers: originHeaders,
-            cf: {
-              // Cloudflare özel ayarları
-              cacheTtl: CACHE_DURATION.edge,
-              cacheEverything: true,
-              polish: 'off',  // Görsel optimizasyonu kapalı (orijinal içeriği koru)
-              minify: { javascript: false, css: false, html: false }
-            }
-          });
-          
-          return originResponse;
-        } finally {
-          // Fetch tamamlandı, map'ten temizle
-          inflightRequests.delete(cacheKeyString);
-        }
-      })();
-      
-      // Map'e ekle (diğer istekler bu promise'i bekleyecek)
-      inflightRequests.set(cacheKeyString, inflightPromise);
-    }
-    
-    // Promise'i await et (ilk istek veya bekleyen istekler)
-    const originResponse = await inflightPromise;
+    // Origin'e istek
+    const originResponse = await fetch(`${ORIGIN_URL}${url.pathname}${url.search}`, {
+      method: request.method,
+      headers: originHeaders,
+      cf: {
+        cacheTtl: 31536000, // 1 Yıl Edge Cache
+        cacheEverything: true
+      }
+    });
 
-    // Origin başarısız olursa
-    if (!originResponse.ok && originResponse.status !== 206 && originResponse.status !== 304) {
-      return new Response(`Origin Error: ${originResponse.status}`, {
+    // 6. Response Header Hazırlığı
+    const responseHeaders = new Headers(originResponse.headers);
+
+    // Origin'den gelen gereksizleri sil
+    ['set-cookie', 'via', 'server', 'x-powered-by'].forEach(h => responseHeaders.delete(h));
+
+    // CORS ekle
+    Object.keys(corsHeaders).forEach(key => responseHeaders.set(key, corsHeaders[key]));
+
+    // Cache Status
+    responseHeaders.set('CF-Cache-Status', 'MISS');
+
+    // Eğer Origin hata döndüyse (404, 500 vs) direkt dön (Cache'leme)
+    if (!originResponse.ok) {
+      return new Response(originResponse.body, {
         status: originResponse.status,
-        headers: {
-          'Content-Type': 'text/plain',
-          'X-Cache': 'ERROR',
-          'Cache-Control': 'no-store'
-        }
+        statusText: originResponse.statusText,
+        headers: responseHeaders
       });
     }
 
-      // Yeni temiz headers oluştur (origin header'larını temizle)
-      const responseHeaders = new Headers();
-      
-      // Content-Length (dosya boyutu - gerekli)
-      const contentLength = originResponse.headers.get('content-length');
-      if (contentLength) {
-        responseHeaders.set('Content-Length', contentLength);
-      }
+    // 7. Body Handling (Teeing) - Kilitlenmeyi önlemek için
+    const body = originResponse.body;
+    
+    // Eğer body yoksa (HEAD request veya 304) direkt dön
+    if (!body) {
+      return new Response(null, {
+        status: originResponse.status,
+        headers: responseHeaders
+      });
+    }
 
-      // Content-Range (partial content için - HLS'de gerekli)
-      const contentRange = originResponse.headers.get('content-range');
-      if (contentRange) {
-        responseHeaders.set('Content-Range', contentRange);
-      }
-      
-      // Aggressive caching headers
-      if (originResponse.status === 200 || originResponse.status === 206) {
-        responseHeaders.set('Cache-Control', 
-          `public, max-age=${CACHE_DURATION.browser}, s-maxage=3600`
-        );
-        
-        // ETag (origin'denkini kullan veya yeni oluştur)
-        const etag = originResponse.headers.get('etag');
-        if (etag) {
-          responseHeaders.set('ETag', etag);
-        } else {
-          responseHeaders.set('ETag', `"${Date.now()}"`);
+    // Stream'i ikiye ayır: Biri kullanıcıya, biri cache'e
+    const [clientStream, cacheStream] = body.tee();
+
+    // Cache'e kaydetme işlemini arka planda yap (waitUntil)
+    waitUntil((async () => {
+      try {
+        // Range requestleri (206) bazen cache.put ile sorun çıkarabilir.
+        // Sadece tam içerikleri (200) cache'lemek daha güvenlidir.
+        if (originResponse.status === 200) {
+          await cache.put(cacheKey, new Response(cacheStream, {
+            status: originResponse.status,
+            headers: responseHeaders
+          }));
         }
-        
-        // Last-Modified (origin'denkini kullan veya yeni oluştur)
-        const lastModified = originResponse.headers.get('last-modified');
-        if (lastModified) {
-          responseHeaders.set('Last-Modified', lastModified);
-        } else {
-          responseHeaders.set('Last-Modified', new Date().toUTCString());
-        }
+      } catch (e) {
+        // Cache hatası olursa client etkilenmesin, logla geç
+        console.error('Cache Put Error:', e);
       }
+    })());
 
-      // CORS headers
-      responseHeaders.set('Access-Control-Allow-Origin', '*');
-      responseHeaders.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-      responseHeaders.set('Access-Control-Max-Age', '86400');
-      
-      // Accept-Ranges (HLS için kritik)
-      responseHeaders.set('Accept-Ranges', 'bytes');
-
-      // Content-Type (her zaman image/jpeg)
-      responseHeaders.set('Content-Type', 'image/jpeg');
-      
-      // Cache Status (MISS - origin'den geldi)
-      responseHeaders.set('CF-Cache-Status', 'MISS');
-
-    // Yeni response oluştur
-    const newResponse = new Response(originResponse.body, {
+    // Kullanıcıya yanıt dön
+    return new Response(clientStream, {
       status: originResponse.status,
       statusText: originResponse.statusText,
       headers: responseHeaders
     });
 
-    // Cache'e kaydet (sadece başarılı istekleri cache'le)
-    if (originResponse.status === 200 || originResponse.status === 206) {
-      // waitUntil ile cache'leme işlemini asenkron yap (response'u geciktirme)
-      waitUntil(cache.put(cacheKey, newResponse.clone()));
-    }
-
-    return newResponse;
-
-  } catch (error) {
-    // Hata durumunda
-    return new Response(`CDN Error: ${error.message}`, {
+  } catch (err) {
+    // Global Hata Yakalama
+    return new Response(`CDN Proxy Error: ${err.message}`, { 
       status: 500,
-      headers: {
-        'Content-Type': 'text/plain',
-        'X-Cache': 'ERROR',
-        'Cache-Control': 'no-store'
-      }
+      headers: corsHeaders // Hata durumunda bile CORS dönmek şart!
     });
   }
 }
